@@ -9,10 +9,6 @@ Flujo:
 4. Actualiza el mapeo en ./mapeo_imagenes.csv
 5. Hace commit y push a GitHub
 6. GitHub Pages publica automáticamente
-
-Uso:
-    python sync_imagenes.py
-    python sync_imagenes.py --force   # re-descarga todo
 """
 
 import os
@@ -26,22 +22,14 @@ from datetime import datetime, timezone
 
 import requests
 from PIL import Image
-
-# ============================================================
-# CONFIG - ajusta estos valores
-# ============================================================
-ARCHIVO_REWARDIX = "rewardix_export.csv"     # CSV que te pasen
-ARCHIVO_MAPEO = "mapeo_imagenes.csv"         # archivo que se genera
-
+ARCHIVO_REWARDIX = "rewardix_export.csv"     
+ARCHIVO_MAPEO = "mapeo_imagenes.csv"         
 CARPETA_IMAGENES = "premios"
-
 GITHUB_USER = "EliasCEMEX"             
 NOMBRE_REPO = "cxal-rewards-images"
-
 URL_BASE_PUBLICA = f"https://{GITHUB_USER}.github.io/{NOMBRE_REPO}/"
 
-# Nombres de columnas esperadas en el CSV de Rewardix
-# Ajustar si el CSV que llegue usa otros nombres
+# Nombres de columnas esperadas en el CSV del proveedor
 COL_ID = "id_premio"
 COL_URL = "url_imagen"
 
@@ -49,30 +37,20 @@ COL_URL = "url_imagen"
 OPTIMIZAR = True
 MAX_ANCHO = 600
 CALIDAD_JPEG = 80
-
-# Throttling para no saturar al proveedor
-PAUSA_ENTRE_DESCARGAS = 0.5   # segundos
-
+PAUSA_ENTRE_DESCARGAS = 0.5   
 # User-Agent para evitar bloqueos por bot
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36"
-}
+                  "Chrome/120.0.0.0 Safari/537.36"}
 
-# ============================================================
 # LOGGING
-# ============================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("sync")
 
-
-# ============================================================
-# UTILIDADES
-# ============================================================
 def cargar_mapeo_local():
     if not os.path.exists(ARCHIVO_MAPEO):
         return {}
@@ -82,7 +60,6 @@ def cargar_mapeo_local():
             mapeo[row["id_premio"]] = row
     return mapeo
 
-
 def guardar_mapeo_local(mapeo):
     campos = ["id_premio", "url_propia", "url_rewardix_original", "fecha_sincronizacion"]
     with open(ARCHIVO_MAPEO, "w", newline="", encoding="utf-8") as f:
@@ -90,7 +67,6 @@ def guardar_mapeo_local(mapeo):
         writer.writeheader()
         for row in mapeo.values():
             writer.writerow(row)
-
 
 def descargar_y_optimizar(url):
     r = requests.get(url, timeout=30, headers=HEADERS)
@@ -107,7 +83,6 @@ def descargar_y_optimizar(url):
                             quality=CALIDAD_JPEG, optimize=True)
     return buffer.getvalue()
 
-
 def git_commit_push():
     fecha = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     try:
@@ -123,10 +98,7 @@ def git_commit_push():
     except subprocess.CalledProcessError as e:
         log.error(f"Error en git: {e}")
 
-
-# ============================================================
 # MAIN
-# ============================================================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true",
