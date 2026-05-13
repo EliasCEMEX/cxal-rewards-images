@@ -19,3 +19,7 @@ Thumbs.db
 
 # Archivos temporales
 *.tmp
+
+# Datos de origen (no subir a GitHub)
+rewardix_export.csv
+*.tmp
