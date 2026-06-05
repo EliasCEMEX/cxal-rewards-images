@@ -12,18 +12,12 @@ Puede ejecutarse de dos formas:
 2. Como módulo importado desde otro script:
        from sync_imagenes import ejecutar_sync
        resultado = ejecutar_sync(archivo_rewardix, force=False, do_push=True)
-
-Flujo:
-1. Asegura las entradas manuales COTIZA (14 y 16) en el mapeo.
-2. Lee el archivo de Rewardix (xlsx o csv) con columnas ID INTERNO + IMAGEN.
-3. Para cada premio, descarga y optimiza la imagen.
-4. La guarda en ./premios/{id}.jpg
-5. Actualiza el mapeo en ./mapeo_imagenes.csv
-6. Hace commit y push a GitHub Pages (solo si hubo cambios reales).
 """
 
 import os
 import csv
+import re
+import ssl
 import time
 import argparse
 import logging
@@ -32,9 +26,24 @@ from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
 
+# === FIX SSL CORPORATIVO ===
+# truststore hace que requests use el truststore del sistema operativo
+# (donde IT instala el CA corporativo de CEMEX). Esto evita los errores
+# SSLError(SSLCertVerificationError) al descargar de dominios internos
+# como cemexalpunto.com.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    logging.warning(
+        "truststore no instalado. Si descargas imágenes de dominios corporativos, "
+        "instala con: pip install truststore"
+    )
+
 import requests
 import pandas as pd
 from PIL import Image
+
 
 # Por defecto el archivo está en Downloads; si se llama como módulo se sobrescribe.
 ARCHIVO_REWARDIX_DEFAULT = Path(
@@ -86,7 +95,48 @@ logging.basicConfig(
 )
 log = logging.getLogger("sync")
 
+
+# =========================================================
 # UTILIDADES
+# =========================================================
+def _normalizar_id_premio(raw_id: str) -> str | None:
+    """
+    Normaliza un ID que puede venir como:
+      - "5757"          -> "5757"
+      - "5757.0"        -> "5757"
+      - "5757-06"       -> "5757"  (variante: misma imagen base)
+      - "5757-06-XL"    -> "5757"
+      - "  5757 "       -> "5757"
+      - "abc" / ""      -> None
+
+    Las variantes con sufijo colapsan a su raíz numérica.
+    Cuando varias variantes del mismo producto aparecen en el archivo,
+    solo la primera dispara descarga; las demás se saltan por estar
+    ya presentes en el mapeo.
+    """
+    if raw_id is None:
+        return None
+
+    s = str(raw_id).strip()
+    if not s or s.lower() == "nan":
+        return None
+
+    # Tomar el primer segmento numérico (antes de cualquier guion u otro separador)
+    match = re.match(r"^\s*(\d+)", s)
+    if not match:
+        return None
+
+    raiz = match.group(1)
+
+    # Limpieza adicional para casos tipo "5757.0"
+    try:
+        raiz = str(int(float(raiz)))
+    except (ValueError, TypeError):
+        pass
+
+    return raiz if raiz else None
+
+
 def cargar_mapeo_local() -> dict:
     if not ARCHIVO_MAPEO.exists():
         return {}
@@ -125,8 +175,6 @@ def descargar_y_optimizar(url: str) -> bytes:
 def git_commit_push() -> None:
     fecha = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     try:
-        # cwd asegura que git corra dentro del repo correcto aunque
-        # se llame desde otro proceso (p.ej. cxal_recommender.py)
         subprocess.run(["git", "add", "."], check=True, cwd=DIR_REPO)
         result = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
@@ -147,11 +195,6 @@ def git_commit_push() -> None:
 
 
 def _leer_archivo_rewardix(ruta: Path) -> list[dict]:
-    """
-    Lee el archivo de Rewardix (xlsx, xls o csv) y devuelve una lista de dicts
-    con las columnas COL_ID y COL_URL.
-    Asume header_row=HEADER_ROW para Excel.
-    """
     ruta = Path(ruta)
     ext = ruta.suffix.lower()
 
@@ -172,33 +215,15 @@ def _leer_archivo_rewardix(ruta: Path) -> list[dict]:
     df = df.dropna(subset=[COL_ID, COL_URL])
     return df.to_dict("records")
 
-# FUNCIÓN PÚBLICA: ejecutar_sync
+
+# =========================================================
+# FUNCIÓN PÚBLICA
+# =========================================================
 def ejecutar_sync(
     archivo_rewardix: Path | str | None,
     force: bool = False,
     do_push: bool = True,
 ) -> dict:
-    """
-    Ejecuta el ciclo completo de sincronización de imágenes.
-
-    Parámetros:
-        archivo_rewardix: ruta al export del proveedor. Si es None,
-            se SALTA la descarga de nuevas imágenes y solo se asegura
-            que COTIZA esté en el mapeo (caso "usar mapeo existente").
-        force: si True, re-descarga imágenes aunque ya existan en el mapeo.
-        do_push: si True, hace git push al final (solo si hubo cambios).
-
-    Devuelve un dict con el resumen:
-        {
-            "nuevos": int,
-            "actualizados": int,
-            "saltados": int,
-            "errores": int,
-            "cotiza_modificado": bool,
-            "total_mapeo": int,
-            "skip_rewardix": bool,
-        }
-    """
     CARPETA_IMAGENES.mkdir(parents=True, exist_ok=True)
     mapeo = cargar_mapeo_local()
 
@@ -240,6 +265,7 @@ def ejecutar_sync(
     actualizados = 0
     errores = 0
     saltados = 0
+    variantes_colapsadas = 0
     skip_rewardix = False
 
     if archivo_rewardix is None:
@@ -265,18 +291,38 @@ def ejecutar_sync(
         total = len(filas)
         log.info(f"Procesando {total} premios del archivo de Rewardix")
 
+        # Set para detectar variantes vistas en esta corrida
+        # (logging informativo: las variantes se colapsan automáticamente
+        # porque la 2da, 3ra, etc. caen en el "ya existe en mapeo")
+        raices_vistas_en_esta_corrida = set()
+
         for i, row in enumerate(filas, 1):
-            id_premio = str(row.get(COL_ID, "")).strip()
+            raw_id = row.get(COL_ID, "")
             url_rewardix = str(row.get(COL_URL, "")).strip()
 
-            # Limpieza adicional para ids tipo "12345.0"
-            try:
-                id_premio = str(int(float(id_premio)))
-            except (ValueError, TypeError):
-                pass
-
-            if not id_premio or not url_rewardix or url_rewardix.lower() == "nan":
+            # >>> CAMBIO CLAVE: normalizar el ID a su raíz numérica <
+            id_premio = _normalizar_id_premio(raw_id)
+            if id_premio is None:
+                log.debug(f"[{i}/{total}] Saltando fila con ID inválido: {raw_id!r}")
                 continue
+
+            if not url_rewardix or url_rewardix.lower() == "nan":
+                continue
+
+            # Reportar colapso de variantes (informativo)
+            raw_id_str = str(raw_id).strip()
+            if raw_id_str != id_premio:
+                if id_premio in raices_vistas_en_esta_corrida:
+                    variantes_colapsadas += 1
+                    log.debug(
+                        f"[{i}/{total}] Variante {raw_id_str} -> raíz {id_premio} "
+                        f"(ya descargada en esta corrida)"
+                    )
+                else:
+                    log.info(
+                        f"[{i}/{total}] Variante {raw_id_str} normalizada a raíz {id_premio}"
+                    )
+            raices_vistas_en_esta_corrida.add(id_premio)
 
             # Proteger IDs COTIZA contra cualquier sobreescritura accidental
             if id_premio in COTIZA_MANUAL:
@@ -291,7 +337,7 @@ def ejecutar_sync(
                 continue
 
             try:
-                log.info(f"[{i}/{total}] Descargando premio {id_premio}...")
+                log.info(f"[{i}/{total}] Descargando premio {id_premio} (raw: {raw_id_str})...")
                 bytes_img = descargar_y_optimizar(url_rewardix)
 
                 nombre_archivo = f"{id_premio}.jpg"
@@ -316,7 +362,7 @@ def ejecutar_sync(
                 time.sleep(PAUSA_ENTRE_DESCARGAS)
 
             except Exception as e:
-                log.error(f"Error con premio {id_premio}: {e}")
+                log.error(f"Error con premio {id_premio} (raw: {raw_id_str}): {e}")
                 errores += 1
 
     # 3) Guardar mapeo y resumen
@@ -324,17 +370,17 @@ def ejecutar_sync(
 
     log.info("=" * 60)
     log.info("Resumen de sincronización:")
-    log.info(f"  Skip Rewardix:    {skip_rewardix}")
-    log.info(f"  Nuevos:           {nuevos}")
-    log.info(f"  Actualizados:     {actualizados}")
-    log.info(f"  Saltados:         {saltados}")
-    log.info(f"  Errores:          {errores}")
-    log.info(f"  COTIZA modif.:    {cotiza_modificado}")
-    log.info(f"  Total mapeo:      {len(mapeo)}")
-    log.info(f"  COTIZA fijos:     {len(COTIZA_MANUAL)}")
+    log.info(f"  Skip Rewardix:        {skip_rewardix}")
+    log.info(f"  Nuevos:               {nuevos}")
+    log.info(f"  Actualizados:         {actualizados}")
+    log.info(f"  Saltados:             {saltados}")
+    log.info(f"  Variantes colapsadas: {variantes_colapsadas}")
+    log.info(f"  Errores:              {errores}")
+    log.info(f"  COTIZA modif.:        {cotiza_modificado}")
+    log.info(f"  Total mapeo:          {len(mapeo)}")
+    log.info(f"  COTIZA fijos:         {len(COTIZA_MANUAL)}")
     log.info("=" * 60)
 
-    # Push si hubo cambios reales
     if do_push and (nuevos > 0 or actualizados > 0 or cotiza_modificado):
         git_commit_push()
 
@@ -342,6 +388,7 @@ def ejecutar_sync(
         "nuevos": nuevos,
         "actualizados": actualizados,
         "saltados": saltados,
+        "variantes_colapsadas": variantes_colapsadas,
         "errores": errores,
         "cotiza_modificado": cotiza_modificado,
         "total_mapeo": len(mapeo),
@@ -349,7 +396,10 @@ def ejecutar_sync(
         "ruta_mapeo": str(ARCHIVO_MAPEO),
     }
 
+
+# =========================================================
 # MAIN (modo script)
+# =========================================================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true",
